@@ -63,21 +63,27 @@ def cart_summary(user_id: int) -> str:
 
 # ---------- Telegram command handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome — Commands: /menu /cart /checkout /clearcart")
+    if update.message:
+        await update.message.reply_text("Welcome — Commands: /menu /cart /checkout /clearcart")
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(f'{p["name"]} ({format_price(p["price"])})', callback_data=f'add:{p["id"]}')] for p in CATALOG]
-    await update.message.reply_text("Choose a product to add to your cart:", reply_markup=InlineKeyboardMarkup(keyboard))
+    if update.message:
+        await update.message.reply_text("Choose a product to add to your cart:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(cart_summary(update.effective_user.id))
+    if update.message and update.effective_user:
+        await update.message.reply_text(cart_summary(update.effective_user.id))
 
 async def clearcart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    CARTS.pop(update.effective_user.id, None)
-    await update.message.reply_text("Cart cleared.")
+    if update.effective_user and update.message:
+        CARTS.pop(update.effective_user.id, None)
+        await update.message.reply_text("Cart cleared.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q or not q.from_user:
+        return
     await q.answer()
     data = q.data or ""
     if not data.startswith("add:"):
@@ -99,6 +105,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Checkout conversation ----------
 async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
     uid = update.effective_user.id
     if not CARTS.get(uid):
         await update.message.reply_text("Your cart is empty. Add items with /menu first.")
@@ -107,11 +115,15 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADDRESS
 
 async def address_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
     context.user_data["address"] = update.message.text.strip()
     await update.message.reply_text("Got it. Now reply with the best phone number to reach you for delivery.")
     return PHONE
 
 async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text or not update.effective_user:
+        return ConversationHandler.END
     context.user_data["phone"] = update.message.text.strip()
     uid = update.effective_user.id
     summary = cart_summary(uid)
@@ -119,11 +131,13 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Confirm and Send Order", callback_data="confirm_order")],
         [InlineKeyboardButton("Cancel", callback_data="cancel_order")]
     ])
-    await update.message.reply_text(f"Please confirm your order:\n\n{summary}\n\nAddress:\n{context.user_data['address']}\nPhone: {context.user_data['phone']}", reply_markup=confirm_kb)
+    await update.message.reply_text(f"Please confirm your order:\n\n{summary}\n\nAddress:\n{context.user_data.get('address', '')}\nPhone: {context.user_data.get('phone', '')}", reply_markup=confirm_kb)
     return ConversationHandler.END
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q or not q.from_user:
+        return
     await q.answer()
     uid = q.from_user.id
     if q.data == "confirm_order":
@@ -155,10 +169,10 @@ def build_email_body(order: dict) -> str:
     cart_text = "\n".join(cart_lines)
     body = (
         f"New order from Telegram bot\n\n"
-        f"From: {user.get('name')} (@{user.get('username')})\n"
-        f"Telegram ID: {user.get('id')}\n\n"
-        f"Delivery address:\n{order.get('address')}\n\n"
-        f"Contact phone: {order.get('phone')}\n\n"
+        f"From: {user.get('name', 'Unknown')} (@{user.get('username', 'None')})\n"
+        f"Telegram ID: {user.get('id', 'Unknown')}\n\n"
+        f"Delivery address:\n{order.get('address', 'Not provided')}\n\n"
+        f"Contact phone: {order.get('phone', 'Not provided')}\n\n"
         f"Order items:\n{cart_text}\n\n"
         f"Total: {format_price(total)}\n\n"
         "Please reply to this email or call to confirm and arrange payment/delivery."

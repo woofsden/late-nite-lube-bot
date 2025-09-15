@@ -9,15 +9,15 @@ def send_order_email(order_text: str):
     """
 
     # Load settings from environment (set these in Replit secrets)
-    smtp_server = os.environ.get("SMTP_SERVER")
+    smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", 587))
     smtp_user = os.environ.get("SMTP_USER")
     smtp_password = os.environ.get("SMTP_PASSWORD")
 
     recipient = "orders@latenitelube.com"
 
-    if not all([smtp_server, smtp_port, smtp_user, smtp_password]):
-        raise ValueError("SMTP environment variables not set!")
+    if not smtp_user or not smtp_password:
+        raise ValueError("SMTP_USER and SMTP_PASSWORD environment variables must be set!")
 
     # Build the email
     msg = MIMEText(order_text)
