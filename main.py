@@ -5,6 +5,8 @@
 import os
 import logging
 import smtplib
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15,6 +17,10 @@ from telegram.ext import (
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Prevent token exposure in logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ---------- Config (from Replit secrets) ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -141,14 +147,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "clear_cart":
         await clearcart(update, context)
 
-    elif data == "start_checkout":
-        if not CARTS.get(uid):
-            await q.edit_message_text("Your cart is empty. Add items first.")
-            return
-        await q.edit_message_text("Please reply with your delivery address (street, city, ZIP).")
-        return ADDRESS
+    # start_checkout is now handled by ConversationHandler - removed unreachable code
 
 # ---------- Checkout conversation ----------
+async def checkout_start_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.from_user:
+        return ConversationHandler.END
+    await q.answer()
+    uid = q.from_user.id
+    if not CARTS.get(uid):
+        await q.edit_message_text("Your cart is empty. Add items first.")
+        return ConversationHandler.END
+    await q.edit_message_text("Please reply with your delivery address (street, city, ZIP).")
+    return ADDRESS
+
 async def address_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return ConversationHandler.END
@@ -194,14 +207,20 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "phone": context.user_data.get("phone", "(not provided)") if context.user_data else "(not provided)",
         }
         try:
-            send_order_email(order)
+            await send_order_email(order)
         except Exception:
             logger.exception("Failed to send order email")
             await q.edit_message_text("Failed to send order email. Contact the store directly.")
             return
         CARTS.pop(uid, None)
+        # Clear user context data to prevent data leakage
+        if context.user_data:
+            context.user_data.clear()
         await q.edit_message_text("Order sent. The store will contact you for confirmation.")
     elif q.data == "cancel_order":
+        # Clear user context data to prevent data leakage
+        if context.user_data:
+            context.user_data.clear()
         await q.edit_message_text("Order cancelled.")
         await show_menu(update, context)
 
@@ -221,7 +240,8 @@ def build_email_body(order: dict) -> str:
     )
     return body
 
-def send_order_email(order: dict):
+def send_order_email_sync(order: dict):
+    """Synchronous email sending function to be run in thread executor."""
     if not SMTP_USER or not SMTP_PASSWORD:
         raise RuntimeError("SMTP_USER or SMTP_PASSWORD not configured in secrets.")
     msg = EmailMessage()
@@ -242,22 +262,40 @@ def send_order_email(order: dict):
             smtp.send_message(msg)
     logger.info("Order email sent to %s", LATE_NITE_EMAIL)
 
+async def send_order_email(order: dict):
+    """Async wrapper for email sending to avoid blocking the event loop."""
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as executor:
+        await loop.run_in_executor(executor, send_order_email_sync, order)
+
 # ---------- Bot startup ----------
 def main():
     logger.info("Starting Telegram bot...")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    try:
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    except Exception as e:
+        # Sanitize error to prevent token exposure in logs
+        if "Invalid token" in str(e) or "Unauthorized" in str(e):
+            logger.error("Invalid Telegram token. Please check TELEGRAM_TOKEN in secrets.")
+        else:
+            logger.error("Failed to initialize bot: %s", type(e).__name__)
+        raise SystemExit(1)
+
+    # Add global error handler
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Exception while handling an update:", exc_info=context.error)
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("Sorry, something went wrong. Please try again or contact support.")
+    
+    app.add_error_handler(error_handler)
 
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", show_menu))
 
-    # Button handler
-    app.add_handler(CallbackQueryHandler(button_handler, pattern=r".*"))
-    app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^(confirm_order|cancel_order)$"))
-
-    # Checkout conversation
+    # Checkout conversation (must be registered before general button handler)
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="start_checkout")],
+        entry_points=[CallbackQueryHandler(lambda update, context: checkout_start_conv(update, context), pattern="start_checkout")],
         states={
             ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address_received)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)],
@@ -267,7 +305,21 @@ def main():
     )
     app.add_handler(conv)
 
-    app.run_polling()
+    # Order confirmation handler (must be before general button handler)
+    app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^(confirm_order|cancel_order)$"))
+
+    # General button handler (narrowed pattern to avoid conflicts)
+    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(add:|view_cart|show_menu|clear_cart)$"))
+
+    try:
+        app.run_polling()
+    except Exception as e:
+        # Sanitize error to prevent token exposure in logs
+        if any(keyword in str(e).lower() for keyword in ["invalid token", "unauthorized", "forbidden", "token"]):
+            logger.error("Authentication failed. Please check TELEGRAM_TOKEN in secrets.")
+        else:
+            logger.error("Bot startup failed: %s", type(e).__name__)
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()
