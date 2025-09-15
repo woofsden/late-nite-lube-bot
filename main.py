@@ -1,0 +1,216 @@
+# main.py
+# Telegram ordering bot - Late Nite Lube
+# Requirements: python-telegram-bot==20.5
+
+import os
+import logging
+import smtplib
+from email.message import EmailMessage
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ConversationHandler, MessageHandler, filters, ContextTypes
+)
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------- Config (from Replit secrets) ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+LATE_NITE_EMAIL = os.getenv("LATE_NITE_EMAIL", "orders@latenitelube.com")
+
+# Basic checks
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN not set (Replit Secrets).")
+if not SMTP_USER or not SMTP_PASSWORD:
+    logger.warning("SMTP_USER or SMTP_PASSWORD not set. Email sending will fail until configured.")
+
+# ---------- Product catalog ----------
+CATALOG = [
+    {"id": "p1", "name": "Astroglide Gel 2oz", "price": 8.99},
+    {"id": "p2", "name": "System JO H2O 4oz", "price": 12.00},
+    {"id": "p3", "name": "Condoms (3-pack)", "price": 5.00},
+    {"id": "p4", "name": "Toy Cleaner 4oz", "price": 9.50},
+]
+
+# In-memory carts and conversation states
+CARTS = {}  # user_id -> list of items
+ADDRESS, PHONE = range(2)
+
+# ---------- Helpers ----------
+def format_price(v: float) -> str:
+    return f"${v:.2f}"
+
+def get_product_by_id(pid: str):
+    return next((p for p in CATALOG if p["id"] == pid), None)
+
+def cart_summary(user_id: int) -> str:
+    cart = CARTS.get(user_id, [])
+    if not cart:
+        return "Your cart is empty."
+    lines = []
+    total = 0.0
+    for it in cart:
+        lines.append(f'{it["qty"]}× {it["name"]} — {format_price(it["price"])} each')
+        total += it["qty"] * it["price"]
+    lines.append(f"\nTotal: {format_price(total)}")
+    return "\n".join(lines)
+
+# ---------- Telegram command handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome — Commands: /menu /cart /checkout /clearcart")
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton(f'{p["name"]} ({format_price(p["price"])})', callback_data=f'add:{p["id"]}')] for p in CATALOG]
+    await update.message.reply_text("Choose a product to add to your cart:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def cart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(cart_summary(update.effective_user.id))
+
+async def clearcart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    CARTS.pop(update.effective_user.id, None)
+    await update.message.reply_text("Cart cleared.")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("add:"):
+        await q.edit_message_text("Unknown action.")
+        return
+    pid = data.split(":", 1)[1]
+    p = get_product_by_id(pid)
+    if not p:
+        await q.edit_message_text("Product not found.")
+        return
+    cart = CARTS.setdefault(q.from_user.id, [])
+    for it in cart:
+        if it["prod_id"] == pid:
+            it["qty"] += 1
+            break
+    else:
+        cart.append({"prod_id": pid, "name": p["name"], "price": p["price"], "qty": 1})
+    await q.edit_message_text(f'Added 1 × {p["name"]} to your cart.\nUse /cart or /checkout.')
+
+# ---------- Checkout conversation ----------
+async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not CARTS.get(uid):
+        await update.message.reply_text("Your cart is empty. Add items with /menu first.")
+        return ConversationHandler.END
+    await update.message.reply_text("Please reply with the delivery address (street, city, ZIP).")
+    return ADDRESS
+
+async def address_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["address"] = update.message.text.strip()
+    await update.message.reply_text("Got it. Now reply with the best phone number to reach you for delivery.")
+    return PHONE
+
+async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = update.message.text.strip()
+    uid = update.effective_user.id
+    summary = cart_summary(uid)
+    confirm_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Confirm and Send Order", callback_data="confirm_order")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_order")]
+    ])
+    await update.message.reply_text(f"Please confirm your order:\n\n{summary}\n\nAddress:\n{context.user_data['address']}\nPhone: {context.user_data['phone']}", reply_markup=confirm_kb)
+    return ConversationHandler.END
+
+async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if q.data == "confirm_order":
+        order = {
+            "telegram_user": {"id": q.from_user.id, "name": q.from_user.full_name, "username": q.from_user.username},
+            "cart": CARTS.get(uid, []),
+            "address": context.user_data.get("address", "(not provided)"),
+            "phone": context.user_data.get("phone", "(not provided)"),
+        }
+        try:
+            send_order_email(order)
+        except Exception:
+            logger.exception("Failed to send order email")
+            await q.edit_message_text("Failed to send order email. Please contact the store directly.")
+            return
+        CARTS.pop(uid, None)
+        await q.edit_message_text("Order sent. The store should contact you to confirm payment/delivery.")
+    else:
+        await q.edit_message_text("Order cancelled.")
+
+# ---------- Email sending ----------
+def build_email_body(order: dict) -> str:
+    user = order["telegram_user"]
+    cart_lines = []
+    total = 0.0
+    for it in order["cart"]:
+        cart_lines.append(f'{it["qty"]} × {it["name"]} @ {format_price(it["price"])}')
+        total += it["qty"] * it["price"]
+    cart_text = "\n".join(cart_lines)
+    body = (
+        f"New order from Telegram bot\n\n"
+        f"From: {user.get('name')} (@{user.get('username')})\n"
+        f"Telegram ID: {user.get('id')}\n\n"
+        f"Delivery address:\n{order.get('address')}\n\n"
+        f"Contact phone: {order.get('phone')}\n\n"
+        f"Order items:\n{cart_text}\n\n"
+        f"Total: {format_price(total)}\n\n"
+        "Please reply to this email or call to confirm and arrange payment/delivery."
+    )
+    return body
+
+def send_order_email(order: dict):
+    if not SMTP_USER or not SMTP_PASSWORD:
+        raise RuntimeError("SMTP_USER or SMTP_PASSWORD not configured in secrets.")
+    body = build_email_body(order)
+    msg = EmailMessage()
+    msg["Subject"] = f"Telegram Order from {order['telegram_user'].get('name')}"
+    msg["From"] = SMTP_USER
+    msg["To"] = LATE_NITE_EMAIL
+    msg.set_content(body)
+
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as smtp:
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+    logger.info("Order email sent to %s", LATE_NITE_EMAIL)
+
+# ---------- Bot startup ----------
+def main():
+    logger.info("Starting Telegram bot...")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("cart", cart_cmd))
+    app.add_handler(CommandHandler("clearcart", clearcart))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^add:"))
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("checkout", checkout_start)],
+        states={
+            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address_received)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^(confirm_order|cancel_order)$"))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
